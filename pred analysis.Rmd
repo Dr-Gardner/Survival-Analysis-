@@ -1,0 +1,811 @@
+---
+title: "Untitled"
+author: "Joshua Gardner"
+date: "2025-07-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(dplyr)
+library(slider)
+library(survival)
+library(ggplot2)
+library(survminer)
+library(randomForestSRC)
+```
+
+```{r load and small cleaning}
+tth<- read.csv("C:/Users/Josh/Documents/Algor1/indp study/tth.csv")
+
+#cleaning leave date resign date and join date
+ld <- read_xlsx("C:/Users/Josh/Documents/Algor1/indp study/leave_dates.xlsx")
+
+
+rd <- read_xlsx("C:/Users/Josh/Documents/Algor1/indp study/resign_dates.xlsx")
+
+
+jd <- read_xlsx("C:/Users/Josh/Documents/Algor1/indp study/join_dates.xlsx")
+
+#adding leave date and resign date to tth
+tth<- tth %>% left_join(ld, "id") 
+tth<- tth %>% left_join(rd, "id") 
+tth<- tth %>% left_join(jd, "id")
+
+tth$date <- as_date(tth$date)
+
+tth1 <- tth %>%
+  mutate(
+    resign_dates = case_when(
+      is.na(resign_dates) & !is.na(leave_date) ~ leave_date,
+      is.na(resign_dates) & is.na(leave_date)  ~ as.Date("2016-12-31"),
+      TRUE ~ resign_dates
+    ),
+    join_date = as.Date(paste("01", month_joined, year_joined), format = "%d %B %Y")
+  )
+tth1 <- tth1 %>%  select(id, name, date, base, grats, peak_ssn, status, resign_dates, join_date)
+
+#selecting resign dates for during study
+tth1 <- tth1 %>% filter(between(resign_dates, as.Date("2010-01-01"), as.Date("2016-12-31"))) %>% 
+                  mutate(id = gsub("[a-zA-Z]+$", "", id)) %>% 
+                  filter(between(date, as.Date("2009-12-02"), as.Date("2016-12-31")))
+
+#removing id 1 because its just Pro Shop I-CIC Non Member
+#removing id 2 bc Club House I-CIC Non Member
+# 3 CCD I-CCD Non Member 4 CMS I-CMS Non Member 5 MSS - Parts I-MSS Non Membe (work orders)
+# id 7 was random nonsense, 10 cash bar no member name
+# 12 Split Tips No Tax I-CIC, 13 Tax Exempt I-CIC Non Member, 15 Zero Dollar Chit
+# 99992 doubtful transactions
+##all these low number id's were non member transactions
+tth1 <- tth1[!(tth1$id %in% c(1,2,3,4,5,7,10,12,13,15, 99992)),]
+
+
+```
+
+```{r ignore combining whole set to descover any weirdness, }
+#grouping and combining base, grat and total
+g1 <- tth1 %>% group_by(id) %>% summarise(a.base = mean(base), a.grats = mean(grats, na.rm = T), a.total = mean(total))
+
+###dont use below
+
+#finding average for 30,60,90 days previous (end date is 31/12/2016)
+#p90 <- tth1 %>% filter(date >= (resign_dates - 365))
+#p90.1 <- p90 %>% select(id, base, grats, total) %>%  group_by(id) %>% summarise(p90.base = mean(base), p90.grats = mean(grats, na.rm = T), p90.total = mean(total))
+
+#using a sliding window
+p90.r <- tth %>% arrange(date) %>% mutate(roll_90d = slide_dbl(base, mean, .before = 89, .complete = TRUE))
+p90.r1 <- p90.r %>% select(id, base, grats, total) %>%  group_by(id) %>% summarise(p90.base = mean(base), p90.grats = mean(grats, na.rm = T), p90.total = mean(total))
+
+p60.r <- tth %>% arrange(date) %>% mutate(roll_60d = slide_dbl(base, mean, .before = 59, .complete = TRUE))
+p60.r1 <- p60.r %>% select(id, base, grats, total) %>%  group_by(id) %>% summarise(p60.base = mean(base), p60.grats = mean(grats, na.rm = T), p60.total = mean(total))
+
+p30.r <- tth %>% arrange(date) %>% mutate(roll_30d = slide_dbl(base, mean, .before = 29, .complete = TRUE))
+p30.r1 <- p30.r %>% select(id, base, grats, total) %>%  group_by(id) %>% summarise(p30.base = mean(base), p30.grats = mean(grats, na.rm = T), p30.total = mean(total))
+```
+
+```{r train creation}
+#i should do train(yr1-4), val(yr5,6), and test(yr7) set
+
+###building training set
+
+#selected important variables. Filtered transactions between 2010-01-01 and 2013-12-31. Created new event variable that set censur date at end of train set 2013-12-31. Added cutoff date for new thing (probably can make more efficient)
+#### I should do my look back the three months before the enf of peak season (5-9)
+train_c <- as_date("2013-12-31")
+
+##dont actually need to run this 
+txn_train <- tth1 %>% select(id, date, base, grats, peak_ssn, resign_dates, join_date) %>% 
+                  filter(between(date, as.Date("2010-01-01"), as.Date("2013-12-31")))
+
+#creating event indicatior
+txn_train <- txn_train %>% mutate(event = if_else(resign_dates <= as.Date("2013-12-31"), 1, 0))
+
+#grouping data
+train <- txn_train %>% group_by(id) %>% summarise(base = mean(base), grats = mean(grats, na.rm = T), txn_count = n())
+txn_uniq <- txn_train %>% distinct(id, event)
+train <- train %>% left_join(txn_uniq,"id")
+
+
+#filter money spent during peak sesason
+windowP <- txn_train %>% filter(peak_ssn == 1)
+
+
+#grouping peak season spending by previous 3 months before end of peak season
+avg_p_train <- windowP %>% group_by(id) %>%
+  summarise(
+    P_base90_avg = mean(base, na.rm = TRUE),
+    P_grats90_avg = mean(grats, na.rm = TRUE),
+    P_txn_90 = n()/4,  # Optional: transaction count
+    .groups = "drop"
+  )
+###drop peak count or divide by 4 becasue of the 4 years
+
+#adding peak season to train
+train <- train %>% left_join(avg_p_train, "id")
+
+
+#pulling event and account age at time of event
+###need to have the act age be the time frame of the training data
+event_acc_age <- txn_train %>%
+  mutate(
+    resign_dates = as_date(resign_dates),
+    join_date    = as_date(join_date),
+    end_date     = pmin(resign_dates, as_date("2013-12-31"), na.rm = TRUE), #pmin picks the min of the two choices
+    tte          = as.numeric(difftime(end_date, join_date, units = "days"))
+  ) %>%
+  distinct(id, tte, .keep_all = TRUE) %>%  # keep unique ids/ttes as in your code
+  select(id, tte)
+
+#adding tte to training set
+train <- train %>% left_join(event_acc_age, "id")
+
+#avg interpurchase time
+avg_inter <- txn_train %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(inter_time = as.numeric(difftime(date, lag(date), units = "days"))) %>%
+  summarise(
+    inter_time = mean(inter_time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+train <- train %>% left_join(avg_inter, "id")
+
+
+#there were a lot of no tte numbers, need to go back and double check
+train <- train %>% drop_na()
+train <- train %>% filter(tte >= 0)
+train <- train %>% select(-P_txn_90)
+
+
+```
+
+```{r Validation creation}
+txn_val <- tth1 %>% select(id, date, base, grats, peak_ssn, resign_dates, join_date) %>% 
+                  filter(between(date, as.Date("2014-01-01"), as.Date("2015-12-31")))
+
+#creating event indicatior
+txn_val <- txn_val %>% mutate(event = if_else(resign_dates <= as.Date("2015-12-31"), 1, 0))
+
+#grouping data
+val <- txn_val %>% group_by(id) %>% summarise(base = mean(base), grats = mean(grats, na.rm = T), txn_count = n()/2)
+txn_uniq_v <- txn_val %>% distinct(id, event)
+val <- val %>% left_join(txn_uniq_v,"id")
+
+
+#filter money spent during peak sesason
+windowP_v <- txn_val %>% filter(peak_ssn == 1)
+
+
+#grouping peak season spending by previous 3 months before end of peak season
+avg_p_val <- windowP_v %>% group_by(id) %>%
+  summarise(
+    P_base90_avg = mean(base, na.rm = TRUE),
+    P_grats90_avg = mean(grats, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+#adding peak season to train
+val <- val %>% left_join(avg_p_val, "id")
+
+
+#pulling event and account age at time of event
+###need to have the act age be the time frame of the training data
+event_acc_age_v <- txn_val %>%
+  mutate(
+    resign_dates = as_date(resign_dates),
+    join_date    = as_date(join_date),
+    end_date     = pmin(resign_dates, as_date("2015-12-31"), na.rm = TRUE),
+    tte          = as.numeric(difftime(end_date, join_date, units = "days"))
+  ) %>%
+  distinct(id, tte, .keep_all = TRUE) %>%  # keep unique ids/ttes as in your code
+  select(id, tte)
+
+#adding tte to training set
+val <- val %>% left_join(event_acc_age_v, "id")
+
+#avg interpurchase time
+avg_inter_v <- txn_val %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(inter_time = as.numeric(difftime(date, lag(date), units = "days"))) %>%
+  summarise(
+    inter_time = mean(inter_time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+val <- val %>% left_join(avg_inter_v, "id")
+
+
+#there were a lot of no tte numbers, need to go back and double check
+val <- val %>% drop_na()
+val <- val %>% filter(tte >= 0)
+```
+
+```{r test set creation}
+#########okay so i think i am leaving data in from people who have resigned? maybe removing negatives will fix that because the negative dates mean they have spent money after resigning
+
+txn_test <- tth1 %>% select(id, date, base, grats, peak_ssn, resign_dates, join_date) %>% 
+                  filter(between(date, as.Date("2016-01-01"), as.Date("2016-12-31")))
+
+#creating event indicatior
+txn_test <- txn_test %>% mutate(event = if_else(resign_dates == as.Date("2016-12-31"), 0, 1))
+
+#grouping data
+test <- txn_test %>% group_by(id) %>% summarise(base = mean(base), grats = mean(grats, na.rm = T), txn_count = n())
+txn_uniq_tst <- txn_test %>% distinct(id, event)
+test <- test %>% left_join(txn_uniq_tst,"id")
+
+
+#filter money spent during peak sesason
+windowP_tst <- txn_test %>% filter(peak_ssn == 1)
+
+
+#grouping peak season spending by previous 3 months before end of peak season
+avg_p_tst <- windowP_tst %>% group_by(id) %>%
+  summarise(
+    P_base90_avg = mean(base, na.rm = TRUE),
+    P_grats90_avg = mean(grats, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+#adding peak season to train
+test <- test %>% left_join(avg_p_tst, "id")
+
+
+#pulling event and account age at time of event
+###need to have the act age be the time frame of the training data
+event_acc_age_tst <- txn_test %>%
+  mutate(
+    resign_dates = as_date(resign_dates),
+    join_date    = as_date(join_date),
+    end_date     = pmin(resign_dates, as_date("2016-12-31"), na.rm = TRUE),
+    tte          = as.numeric(difftime(end_date, join_date, units = "days"))
+  ) %>%
+  distinct(id, tte, .keep_all = TRUE) %>%  # keep unique ids/ttes as in your code
+  select(id, tte)
+
+#adding tte to training set
+test <- test %>% left_join(event_acc_age_tst, "id")
+
+#avg interpurchase time
+avg_inter_tst <- txn_test %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(inter_time = as.numeric(difftime(date, lag(date), units = "days"))) %>%
+  summarise(
+    inter_time = mean(inter_time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+test <- test %>% left_join(avg_inter_tst, "id")
+
+
+#there were a lot of no tte numbers, need to go back and double check
+test <- test %>% drop_na()
+
+test <- test %>% filter(tte >= 0)
+```
+
+```{r remove previous churns}
+#removing this to prevent data leakage 
+train_churn_ids <- train %>%
+  filter(event == 1) %>%
+  distinct(id) %>%
+  pull(id)
+
+#removing from val set
+val_clean <- val %>%
+  filter(!(id %in% train_churn_ids))
+
+
+#pulling ids from val set churners
+val_churn_ids <- val_clean %>%
+  filter(event == 1) %>%
+  distinct(id) %>%
+  pull(id)
+
+#removing train and val churn ids from test
+test_clean <- test %>%
+  filter(!(id %in% c(train_churn_ids, val_churn_ids)))
+
+#this only removed 11 items but better it did than ignored the problem
+```
+
+```{r making full set for viz}
+#Want to look at the whole set first
+txn_full <- tth1 %>% select(id, date, base, grats, peak_ssn, resign_dates, join_date) %>% 
+                  filter(between(date, as.Date("2010-01-01"), as.Date("2016-12-31")))
+
+#creating event indicatior
+txn_full <- txn_full %>% mutate(event = if_else(resign_dates <= as.Date("2016-12-31"), 1, 0))
+
+#grouping data
+full <- txn_full %>% group_by(id) %>% summarise(base = mean(base), grats = mean(grats, na.rm = T), txn_count = n())
+txn_uniq_F <- txn_full %>% distinct(id, event)
+full <- full %>% left_join(txn_uniq_F,"id")
+
+
+#filter money spent during peak sesason
+#windowP_F <- txn_full %>% filter(peak_ssn == 1)
+
+
+#grouping peak season spending by previous 3 months before end of peak season
+# avg_p_val <- windowP_v %>% group_by(id) %>%
+#   summarise(
+#     P_base90_avg = mean(base, na.rm = TRUE),
+#     P_grats90_avg = mean(grats, na.rm = TRUE),
+#     .groups = "drop"
+#   )
+
+
+#adding peak season to train
+#full <- full %>% left_join(avg_p_val, "id")
+
+
+#pulling event and account age at time of event
+###need to have the act age be the time frame of the training data
+event_acc_age_F <- txn_full %>%
+  mutate(
+    resign_dates = as_date(resign_dates),
+    join_date    = as_date(join_date),
+    end_date     = pmin(resign_dates, as_date("2016-12-31"), na.rm = TRUE),
+    tte          = as.numeric(difftime(end_date, join_date, units = "days"))
+  ) %>%
+  distinct(id, tte, .keep_all = TRUE) %>%  # keep unique ids/ttes as in your code
+  select(id, tte)
+
+#adding tte to training set
+full <- full %>% left_join(event_acc_age_F, "id")
+
+#avg interpurchase time
+avg_inter_F <- txn_full %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(inter_time = as.numeric(difftime(date, lag(date), units = "days"))) %>%
+  summarise(
+    inter_time = mean(inter_time, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+full <- full %>% left_join(avg_inter_F, "id")
+
+
+#there were a lot of no tte numbers, need to go back and double check
+full <- full %>% drop_na()
+full <- full %>% filter(tte >= 0)
+
+
+
+L_full <- full %>% select(-id) %>% pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+ggplot(L_full, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Variables", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+ggplot(L_full, aes(x = Value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Variables", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+```
+```{r train, val, test viz}
+#train
+L_train <- train %>% select(-id) %>% pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+ggplot(L_train, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "train", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+ggplot(L_train, aes(x = Value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "traib", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+#Validate
+L_val <- val_clean %>% select(-id) %>% pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+ggplot(L_val, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "val", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+ggplot(L_val, aes(x = Value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "val", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+#test
+L_test <- test_clean %>% select(-id) %>% pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+ggplot(L_test, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Test", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+ggplot(L_test, aes(x = Value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Test", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+#scaled and centered 
+L_full_scaled <- full %>% select(-id) %>% 
+  mutate(across(c(base, grats, txn_count, tte, inter_time),
+                ~ as.numeric(scale(.)),
+                .names = "{.col}_z")) %>%
+               select(ends_with("_z")) %>% 
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+  
+
+
+ggplot(L_full_scaled, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Full scaled", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+ggplot(L_full_scaled, aes(x = Value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Full scaled", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+#min maxed
+L_full_mm <- full %>% select(-id) %>% 
+  mutate(across(c(base, grats, txn_count, tte, inter_time),
+                ~ (. - min(., na.rm = TRUE)) /
+                  (max(., na.rm = TRUE) - min(., na.rm = TRUE)),
+                .names = "{.col}_mm")) %>% 
+  select(ends_with("_mm")) %>% 
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+ggplot(L_full_mm, aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Full scaled", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+
+ggplot(L_full_mm, aes(x = Value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Full scaled", x = NULL, y = "Frequency") +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+At this point i think i will end up just trying all the different ways and see which ends up giving me the best results
+```{r cox regression training}
+# cox_fit <- coxph(Surv(tte, event)~ base + grats + txn_count + P_base90_avg + P_grats90_avg + inter_time, 
+#                                   data = train, ties = "efron")
+# 
+# summary(cox_fit)
+# cox.zph(cox_fit)
+
+#i removed both P indicators after checking to see if they were significant
+cox_fit1 <- coxph(Surv(tte, event)~ base + grats + txn_count + inter_time, 
+                                  data = train, ties = "efron",
+                                  x = TRUE, y = TRUE)
+
+summary(cox_fit1)
+cox.zph(cox_fit1)
+
+#my base violates proportional hazards because it does change over time. Using Time-varying effect now
+cox_fit2 <- coxph(
+  Surv(tte, event) ~ grats + txn_count + inter_time + base + tt(base),
+  data = train, ties = "efron", x = TRUE, y = TRUE,
+  tt = function(x, t, ...) x * log(pmax(t, 1))
+)
+cox.zph(cox_fit2) 
+summary(cox_fit2)
+summary(cox_fit1)
+####I should also try iqr range
+```
+
+```{r cox regression validation}
+#cox_fit1: no time varying effect
+#cox_fit2: time varying effect
+
+c1 <- concordance(cox_fit1, newdata = val_clean)
+
+
+print("c1")
+c1$concordance          # the C-index
+sqrt(c1$var)            # standard error
+
+#because of the tt() time varying variable i can not run concordance for cox_fit2
+
+```
+```{r run on test set}
+c_out <- concordance(cox_fit, newdata = test_clean)  
+c_out$concordance          # C-index
+sqrt(c_out$var) 
+```
+
+```{r visualizations, bad}
+test_clean$lp <- predict(cox_fit, newdata = test_clean, type = "lp")
+
+# quartiles of risk
+test_clean <- test_clean %>% mutate(risk_q = ntile(lp, 4))
+test_clean <- test_clean %>% mutate(risk_q = ntile(lp, 4))
+sf <- survfit(Surv(tte, event) ~ risk_q, data = test_clean)
+t95 <- quantile(test_clean$tte, 0.95, na.rm = TRUE)
+
+g1 <- ggsurvplot(sf, data = test_clean,
+            conf.int = FALSE, 
+            censor = FALSE,
+            xlim = c(0, t95),                # trim long tail
+            xscale = "d_y",                  # days → years
+            break.x.by = 365,                # tick every year
+            xlab = "Years since entry",
+            ylab = "Survival probability",
+            ggtheme = theme_minimal(base_size = 12),
+            legend = "bottom",
+            legend.title = "Risk quartile",
+            palette = "Dark2",
+            risk.table = TRUE,
+            risk.table.height = 0.18,
+            risk.table.y.text.col = TRUE,
+            risk.table.fontsize = 3)
+
+
+
+g2 <- ggsurvplot(sf, data=test_clean, fun="event",  # plots 1 - S(t)
+           conf.int=FALSE, censor=FALSE, xscale="d_y", break.x.by=365,
+           xlab="Years", ylab="Cumulative churn probability",
+           risk.table=TRUE, ggtheme=theme_minimal())
+
+g3 <- ggsurvplot(sf, data=test_clean, conf.int=FALSE, censor=FALSE,
+           xscale="d_y", break.x.by=365, xlab="Years",
+           ylim=c(0.7,1.0), risk.table=TRUE, ggtheme=theme_minimal())
+
+g4 <- ggsurvplot(sf, data=test_clean, conf.int=FALSE,
+           censor=TRUE, censor.shape="|", censor.size=0.6,
+           xscale="d_y", break.x.by=365, risk.table=TRUE)
+
+
+```
+
+```{r survival forest }
+set.seed(42)
+
+var1 <- c("base", "grats", "txn_count", "inter_time")
+var2 <- c("base", "grats", "txn_count", "inter_time", "P_base90_avg", "P_grats90_avg")
+
+rsf_fit1 <- rfsrc(
+        formula = Surv(tte, event) ~ base + grats + txn_count + inter_time,
+        data = train,
+        ntree = 1000,
+        mtry = max(1, floor(sqrt(length(var1)))),
+        nodesize = 15,
+        nsplit = 10,
+        importance = "permute",
+        na.action = "na.impute",
+        block.size = 1
+)
+
+rsf_fit1
+
+#i think fit2 is slightly worse
+
+rsf_fit2 <- rfsrc(
+        formula = Surv(tte, event) ~ base + grats + txn_count + inter_time + P_base90_avg + P_grats90_avg,
+        data = train,
+        ntree = 1000,
+        mtry = max(1, floor(sqrt(length(var2)))),
+        nodesize = 15,
+        nsplit = 10,
+        importance = "permute",
+        na.action = "na.impute",
+        block.size = 1
+)
+
+rsf_fit2
+```
+
+```{r rf hyper tune}
+set.seed(42)
+tuned <- tune.rfsrc(
+        Surv(tte, event) ~ base + grats + txn_count + inter_time,
+        data = train,
+        ntreeTry = 1000,
+        mtryStart = max(1, floor(sqrt(length(vars)))),
+        nodesizeTry = c(5, 10, 15, 20),
+        nsplitTry = c(0, 10, 20)
+)
+
+tuned$optimal
+
+#optimal tuning nodesize (5)    mtry (4)
+rsf_tuned <- rfsrc(
+        formula = Surv(tte, event) ~ base + grats + txn_count + inter_time,
+        data = train,
+        ntree = 1000,
+        mtry = 4,
+        nodesize = 5,
+        nsplit = 10,
+        importance = "permute",
+        na.action = "na.impute",
+        block.size = 1
+)
+```
+
+
+
+
+```{r I am struggling to understand how this is working}
+# Inspect your follow-up window
+max_t <- max(val_clean$tte, na.rm = TRUE)
+
+# Build a safe time grid inside your data’s support
+evt <- with(val_clean, tte[event == 1])
+cand <- sort(unique(c(180, 365,540, 730,
+                      as.numeric(quantile(evt, c(.25, .5, .75), na.rm = TRUE)))))
+
+times_grid <- cand[cand > 0 & cand < max_t]
+if (length(times_grid) == 0) times_grid <- floor(0.8 * max_t)  # fallback
+
+# Now Score() will run
+sc <- Score(object  = list(M2 = cox_fit2),
+            formula = Surv(tte, event) ~ 1,
+            data    = val_clean,
+            times   = times_grid,
+            metrics = c("auc","brier"),
+            summary = "ipa")
+
+
+
+```
+
+```{r ignore adding p90 days transactions }
+#attaching 30,60,90 rolling avg
+g2 <- g1 %>% left_join(p90.r1, "id")
+g2 <- g2 %>% left_join(p60.r1, "id")
+g2 <- g2 %>% left_join(p30.r1, "id")
+
+#creating age of account
+age <- jd %>% left_join(rd, "id")
+age <- age %>% mutate(combined_date = as.Date(paste("01", month_joined, year_joined), format = "%d %B %Y"))
+age <- age %>% mutate(id = gsub("^0+|[a-zA-Z]+$", "", id))
+age <- age %>% mutate(resign_dates = if_else(is.na(resign_dates), as.Date("2016-12-31"), resign_dates))
+age$combined_date <- as.POSIXct(age$combined_date)
+age <- age %>% mutate(act_age = as.numeric(resign_dates - combined_date, units = "days"))
+age1 <- age %>% select("id", "act_age")
+
+#attaching age to g2
+g3<- g2 %>% left_join(age1, "id")
+
+#i am getting duplicates so I am removing them
+g4 <- unique(g3)
+```
+
+```{r ignore creating recency and frequency}
+#creating a recency date to prevent the recency date from being too close to churn data and leaking future information 
+#feels weird using the churn date or censure date too
+#i can also do the below with current time stamp too but this a set time frame
+
+#there are 146 negative recency meaning they made pucheses after their resign date. Either i need to remove them or go in and find their purchase before the cutoff date. (I think im gonna remove them because I will still have over 6k obs)
+reference_cutoff <- tth1 %>%
+  filter(!is.na(resign_dates)) %>%
+  group_by(id) %>%
+  summarise(
+    cutoff_date = as.Date(resign_dates[1]) - 30,
+    .groups = "drop"
+  )
+
+#adding to total transaction history 1
+tth1 <- tth1 %>% left_join(reference_cutoff, "id")
+
+#recency and frequence added
+rf_features <- tth1 %>%
+  group_by(id) %>%
+  summarise(
+    recency = as.numeric(as.Date(resign_dates[1]) - max(as.Date(date), na.rm = TRUE)),
+    frequency = n(),
+    .groups = "drop"
+  )
+#removing all negative rec because either something is wrong or they are going to mess up future things
+rf_neg <- rf_features %>% filter(recency<0)
+
+tth2 <- tth1 %>% filter(!(id %in% rf_neg$id))
+
+rf_features1 <- tth2 %>%
+  group_by(id) %>%
+  summarise(
+    recency = as.numeric(as.Date(resign_dates[1]) - max(as.Date(date), na.rm = TRUE)),
+    frequency = n(),
+    .groups = "drop"
+  )
+#adding factor variable for resign vs censure 
+tth2 <- tth2 %>% mutate(event = if_else(resign_dates == as.Date("2016-12-31"), 0, 1))
+tth2$event <- as.factor(tth2$event)
+```
+
+```{r needed to see what was going on dont run}
+temp <- tth %>% filter(id==434) 
+temp1 <- trainF %>% filter(is.na(id))
+temp2 <- tth1 %>% filter(category == "DUES")
+
+#i need to grab all ID's with negative recency and filter out their purchaces post leave date.
+#also look into the large numbers and see if i see dues on the board and go from there
+```
+
+```{r IGNORE breaking into train and test sets building survival models}
+#i should do train(yr1-4), val(yr5), and test(yr6) set
+
+###building training set
+
+#selected important variables. Filtered transactions between 2010-01-01 and 2013-12-31. Created new event variable that set censur date at end of train set 2013-12-31. Added cutoff date for new thing (probably can make more efficient)
+
+# train <- tth2 %>% select(id, date, base, grats, peak_ssn, resign_dates, join_date, event) %>% 
+#                   filter(between(date, as.Date("2010-01-01"), as.Date("2013-12-31"))) %>% 
+#                   mutate(event = if_else(resign_dates >= as.Date("2013-12-31"), 0, 1)) %>% 
+#                   mutate(resign_dates = as.Date(resign_dates), 
+#                          cutoff_date = if_else(event == 1, resign_dates, as.Date("2013-12-31")))
+# 
+# #selecting for 90,60,30 day window of each person
+# window90 <- train %>% filter(date >= (cutoff_date - 90) & date < cutoff_date)
+# window60 <- train %>% filter(date >= (cutoff_date - 60) & date < cutoff_date)
+# window30 <- train %>% filter(date >= (cutoff_date - 30) & date < cutoff_date)
+# 
+# #creating grouped avg and 30,60,90 avg and transaction count
+# avg_369 <- window90 %>%
+#   group_by(id) %>%
+#   summarise(
+#     base90_avg = mean(base, na.rm = TRUE),
+#     grats90_avg = mean(grats, na.rm = TRUE),
+#     txn_90 = n(),  # Optional: transaction count
+#     .groups = "drop"
+#   )
+# 
+# tmp60 <- window60 %>%
+#   group_by(id) %>%
+#   summarise(
+#     base60_avg = mean(base, na.rm = TRUE),
+#     grats60_avg = mean(grats, na.rm = TRUE),
+#     txn_60 = n(),  # Optional: transaction count
+#     .groups = "drop"
+#   )
+# 
+# tmp30 <- window30 %>%
+#   group_by(id) %>%
+#   summarise(
+#     base30_avg = mean(base, na.rm = TRUE),
+#     grats30_avg = mean(grats, na.rm = TRUE),
+#     txn_30 = n(),  # Optional: transaction count
+#     .groups = "drop"
+#   )
+# avg_369 <- avg_369 %>% left_join(tmp60, "id") %>% left_join(tmp30, "id")
+
+#creating groupings based on user id and creating a sliding window at 30,60 and 90 days
+##think i dont actually need to do this till i work on time series
+# train_g <- train %>% arrange(id, date) %>% 
+#                       group_by(id) %>%
+#                       mutate(base90 = slide_dbl(base, mean, .before = 89, .complete = TRUE),
+#                              grat90 = slide_dbl(grats, mean, .before = 89, .complete = TRUE)) %>% 
+#                       ungroup()
+  
+
+```
